@@ -30,8 +30,22 @@ class FastGlobalAvgPool2d(nn.Module):
             return x.view(x.size(0), x.size(1), -1).mean(-1).view(x.size(0), x.size(1), 1, 1)
 
 
+class SE(nn.Module):
+    def __init__(self, c, reduction=16):
+        super(SE, self).__init__()
+        self.conv1 = nn.Conv2d(c, c // reduction, kernel_size=1, bias=True)
+        self.ac1 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(c // reduction, c, kernel_size=1, bias=True)
+        self.ac2 = nn.Sigmoid()
+
+    def forward(self, x):
+        return 2 * self.ac2(self.conv2(self.ac1(self.conv1(x))))
+
+
 class Shuffle_Cat(nn.Module):
-    def __init__(self, c, c1, c2, g=16, reduction=16):
+    def __init__(self, c, c1, c2, g=16, reduction=16, conv_cfg=None,
+                 norm_cfg=dict(type='BN', requires_grad=True),
+                 act_cfg=dict(type='LeakyReLU', negative_slope=0.1)):
         """
         args:
             c: 输出维度
@@ -41,26 +55,37 @@ class Shuffle_Cat(nn.Module):
         super(Shuffle_Cat, self).__init__()
         self.GlobalAvgPool2d = FastGlobalAvgPool2d(flatten=False) # [N, C, 1, 1]
         self.g = g
-        self.c = c
-        self.c1 = c1
-        self.c2 = c2
+        # self.c = c
+        # self.c1 = c1
+        # self.c2 = c2
         c_ = c1 + c2
-        self.conv1 = nn.Conv2d(c_, c_ // reduction, kernel_size=1, bias=True, groups=2)
-        self.ac1 = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(c_ // reduction, c_, kernel_size=1, bias=True, groups=2)
-        self.ac2 = nn.Sigmoid()
+        # self.conv1 = nn.Conv2d(c_, c_ // reduction, kernel_size=1, bias=True, groups=2)
+        # self.ac1 = nn.ReLU(inplace=True)
+        # self.conv2 = nn.Conv2d(c_ // reduction, c_, kernel_size=1, bias=True, groups=2)
+        # self.ac2 = nn.Sigmoid()
+
+        self.low_se = SE(c1, reduction)
+        self.high_se = SE(c2, reduction)
+
         # self.conv3 = DWConv(c_, c, k=3)
-        self.conv3 = nn.Sequential(nn.Conv2d(c_, c_, 1, 1, groups=self.g, bias=False),
-                                   nn.BatchNorm2d(c_),
-                                   nn.Hardswish())
-        self.conv4 = nn.Sequential(nn.Conv2d(c_, c, 1, 1, groups=self.g, bias=False),
-                                   nn.BatchNorm2d(c),
-                                   nn.Hardswish())
+        # 将原先的2个GCONV合成一个
+        # self.conv3 = nn.Sequential(nn.Conv2d(c_, c_, 1, 1, groups=self.g, bias=False),
+        #                            nn.BatchNorm2d(c_),
+        #                            nn.LeakyReLU(inplace=True))
+        # self.conv4 = nn.Sequential(nn.Conv2d(c_, c, 1, 1, groups=self.g, bias=False),
+        #                            nn.BatchNorm2d(c),
+        #                            nn.LeakyReLU(inplace=True))
 
-        self.low_conv = ConvModule(c1, c2, 3)
-        self.hight_conv = ConvModule(c2, c2, 1)
+        # self.conv3 = nn.Sequential(nn.Conv2d(c_, c, 1, 1, groups=self.g, bias=False),
+        #                            nn.BatchNorm2d(c),
+        #                            nn.LeakyReLU(inplace=True))
 
+        cfg = dict(conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg)
 
+        self.low_conv = ConvModule(c1, c1, 3, padding=1, **cfg)
+        self.hight_conv = ConvModule(c2, c2, 1, **cfg)
+
+        self.conv3 = ConvModule(c_, c, 1, groups=self.g, **cfg)
 
     def channel_shuffle(self, x, groups):
         batchsize, num_channels, height, width = x.data.size()
@@ -68,26 +93,28 @@ class Shuffle_Cat(nn.Module):
         channels_per_group = num_channels // groups
         # reshape
         x = x.view(batchsize, groups, channels_per_group, height, width)
-
-        # transpose
-        # - contiguous() required if transpose() is used before view().
-        #   See https://github.com/pytorch/pytorch/issues/764
         x = torch.transpose(x, 1, 2).contiguous()
-
         # flatten
         x = x.view(batchsize, -1, height, width)
         return x
 
     def forward(self, x):
-        # low: [N, C1, H, W], hight: [N, C2, H, W]
+        # low: [N, C1, H, W], high: [N, C2, H, W]
         x1, x2 = x
         x1 = self.low_conv(x1)
         x2 = self.hight_conv(x2)
+
+        x1 *= self.low_se(self.GlobalAvgPool2d(x1))
+        x2 *= self.high_se(self.GlobalAvgPool2d(x2))
+
         x = torch.cat([x1, x2], dim=1)
-        x_gp = 2 * self.ac2(self.conv2(self.ac1(self.conv1(self.GlobalAvgPool2d(x))))) # [N, C1+C2, 1, 1]
-        x *= x_gp
+        # [N, C1+C2, 1, 1]
+        # x_gp = 2 * self.ac2(self.conv2(self.ac1(self.conv1(self.GlobalAvgPool2d(x)))))
+        # x *= x_gp
+
         x = self.channel_shuffle(x, groups=self.g)
-        x = self.conv4(self.conv3(x))
+        # x = self.conv4(self.conv3(x))
+        x = self.conv3(x)
         return x
 
 
@@ -142,7 +169,7 @@ class DetectionBlock(nn.Module):
 
 
 @NECKS.register_module()
-class YOLOV3Neck(nn.Module):
+class ShuffleCatNeck(nn.Module):
     """The neck of YOLOV3.
 
     It can be treated as a simplified version of FPN. It
@@ -173,7 +200,7 @@ class YOLOV3Neck(nn.Module):
                  conv_cfg=None,
                  norm_cfg=dict(type='BN', requires_grad=True),
                  act_cfg=dict(type='LeakyReLU', negative_slope=0.1)):
-        super(YOLOV3Neck, self).__init__()
+        super(ShuffleCatNeck, self).__init__()
         assert (num_scales == len(in_channels) == len(out_channels))
         self.num_scales = num_scales
         self.in_channels = in_channels
@@ -188,12 +215,19 @@ class YOLOV3Neck(nn.Module):
         # To support arbitrary scales, the code looks awful, but it works.
         # Better solution is welcomed.
         self.detect1 = DetectionBlock(in_channels[0], out_channels[0], **cfg)
+        in_c, out_c = [], []
         for i in range(1, self.num_scales):
-            in_c, out_c = self.in_channels[i], self.out_channels[i]
-            self.add_module(f'conv{i}', ConvModule(in_c, out_c, 1, **cfg))
+            # in_c, out_c = self.in_channels[i], self.out_channels[i]
+            in_c.append(self.in_channels[i])
+            out_c.append(self.out_channels[i])
+            self.add_module(f'conv{i}', ConvModule(in_c[i-1], out_c[i-1], 1, **cfg))
+
+            self.add_module(f'shuffle_cat{i}', Shuffle_Cat(out_c[i-1]+in_c[i-1],
+                                                           out_c[i-1], in_c[i-1]))
+
             # in_c + out_c : High-lvl feats will be cat with low-lvl feats
             self.add_module(f'detect{i+1}',
-                            DetectionBlock(in_c + out_c, out_c, **cfg))
+                            DetectionBlock(out_c[i-1]+in_c[i-1], out_c[i-1], **cfg))
 
     def forward(self, feats):
         assert len(feats) == self.num_scales
@@ -209,9 +243,16 @@ class YOLOV3Neck(nn.Module):
             tmp = conv(out)
 
             # Cat with low-lvl feats
+            # tmp: low; x: high
             tmp = F.interpolate(tmp, scale_factor=2)
-            tmp = torch.cat((tmp, x), 1)
+            # print('tmp', tmp.shape)
+            # print('x', x.shape)
+            # tmp = torch.cat((tmp, x), 1)
+            # 使用shuffle cat替换普通的cat
+            shuffle_cat = getattr(self, f'shuffle_cat{i+1}')
+            tmp = shuffle_cat((tmp, x))
 
+            # tmp = Shuffle_Cat()
             detect = getattr(self, f'detect{i+2}')
             out = detect(tmp)
             outs.append(out)
